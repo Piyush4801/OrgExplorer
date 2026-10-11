@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react'
+import React, { useState, useMemo, useEffect } from 'react'
 import { FiRefreshCw, FiExternalLink } from 'react-icons/fi'
 import { useApp } from '../context/AppContext'
 import { C, PageTitle, EmptyOk } from '../components/UI'
@@ -42,26 +42,75 @@ const getStatus = ratio => {
 }
 
 export default function GovernancePage() {
-  const { model, issuesData, runAudit, govLoading, auditComplete, loading, runGovernanceAnalysis,staleRepoStats } = useApp()
+  const { orgs, model, issuesData, runAudit, govLoading, auditComplete, loading, runGovernanceAnalysis, staleRepoStats } = useApp()
   const [tab, setTab] = useState('dead')
+  const [orgFilter, setOrgFilter] = useState('All Organizations')
+
+  const orgOptions = useMemo(() => {
+    if (orgs && orgs.length > 0) {
+      return orgs.map(o => (typeof o === 'string' ? o : o.login)).filter(Boolean)
+    }
+    const foundOrgs = new Set()
+    model?.allRepos?.forEach(r => { if (r.orgLogin) foundOrgs.add(r.orgLogin) })
+    Object.keys(issuesData || {}).forEach(k => {
+      const org = k.split('/')[0]
+      if (org) foundOrgs.add(org)
+    })
+    return Array.from(foundOrgs)
+  }, [orgs, model, issuesData])
+
+  useEffect(() => {
+    setOrgFilter('All Organizations')
+  }, [orgs])
+
+  const isMulti = (orgs?.length > 1) || orgOptions.length > 1
 
   const ITEMS_PER_PAGE = 10
   const [stalePage, setStalePage] = useState(1)
-  const totalPages = Math.ceil(staleRepoStats.length / ITEMS_PER_PAGE)
 
-  const paginatedStaleRepos = useMemo(() => {
-    const start = (stalePage - 1) * ITEMS_PER_PAGE
-    return staleRepoStats.slice(start, start + ITEMS_PER_PAGE)
-  }, [staleRepoStats, stalePage])
-  // Flatten all issues and tag with repo/org
+  useEffect(() => {
+    setStalePage(1)
+  }, [orgFilter])
+
+  // Flatten all issues and tag with repo/org safely
   const allIssues = useMemo(() => {
     const arr = []
     Object.entries(issuesData || {}).forEach(([key, issues]) => {
-      const [org, repo] = key.split('/')
-      issues.forEach(i => arr.push({ ...i, repoName: repo, orgName: org }))
+      const parts = key.split('/')
+      const org = parts.length > 1 ? parts[0] : ''
+      const repo = parts.length > 1 ? parts.slice(1).join('/') : key
+      if (Array.isArray(issues)) {
+        issues.forEach(i => arr.push({ ...i, repoName: repo, orgName: org }))
+      }
     })
     return arr
   }, [issuesData])
+
+  const filteredIssues = useMemo(() => {
+    if (orgFilter === 'All Organizations') {
+      return allIssues
+    }
+    return allIssues.filter(i => Boolean(i.orgName) && i.orgName === orgFilter)
+  }, [allIssues, orgFilter])
+
+  const filteredAllRepos = useMemo(() => {
+    const repos = model?.allRepos || []
+    if (orgFilter === 'All Organizations') return repos
+    return repos.filter(r => Boolean(r.orgLogin) && r.orgLogin === orgFilter)
+  }, [model?.allRepos, orgFilter])
+
+  const filteredStaleRepoStats = useMemo(() => {
+    const stats = staleRepoStats || []
+    if (orgFilter === 'All Organizations') return stats
+    return stats.filter(r => Boolean(r.org) && r.org === orgFilter)
+  }, [staleRepoStats, orgFilter])
+
+  const totalPages = Math.ceil(filteredStaleRepoStats.length / ITEMS_PER_PAGE)
+
+  const paginatedStaleRepos = useMemo(() => {
+    const start = (stalePage - 1) * ITEMS_PER_PAGE
+    return filteredStaleRepoStats.slice(start, start + ITEMS_PER_PAGE)
+  }, [filteredStaleRepoStats, stalePage])
 
   if(loading) return <GovernanceSkeleton />
   if (!model) return null
@@ -70,23 +119,23 @@ export default function GovernancePage() {
   const daysSince = d => Math.floor((Date.now() - new Date(d)) / 86_400_000)
 
   // Health check 1 — Dead Issues (>90 days open, not a PR)
-  const deadIssues = allIssues
+  const deadIssues = filteredIssues
     .filter(i => !i.pull_request && i.state === 'open' && daysSince(i.created_at) >= 90)
     .sort((a, b) => daysSince(b.created_at) - daysSince(a.created_at))
 
   // Health check 2 — Percentage of dead issues relative to all issues
-  const staleIssuesRatio = allIssues.length ? (deadIssues.length / allIssues.length) * 100 : 0;
+  const staleIssuesRatio = filteredIssues.length ? (deadIssues.length / filteredIssues.length) * 100 : 0;
 
   // Health check 3 — Zombie PRs (>90 days open)
-  const zombiePRs = allIssues
+  const zombiePRs = filteredIssues
     .filter(i => i.pull_request && i.state === 'open' && daysSince(i.created_at) >= 90)
     .sort((a, b) => daysSince(b.created_at) - daysSince(a.created_at))
 
   // Health check 4 — No license
-  const noLicense = model.allRepos.filter(r => !r.license && !r.archived && !r.fork)
+  const noLicense = filteredAllRepos.filter(r => !r.license && !r.archived && !r.fork)
 
   // Issue resolution rate per repo
-  const topRepos = model.allRepos.slice(0, 8)
+  const topRepos = filteredAllRepos.slice(0, 8)
 
   const counts = { dead: deadIssues.length, zombie: zombiePRs.length, license: noLicense.length, stale: staleIssuesRatio.toFixed(2) }
 
@@ -107,7 +156,10 @@ export default function GovernancePage() {
         <div style={{ fontSize: 11, color: 'var(--text2)' }}>#{item.number} · @{item.user?.login}</div>
       </td>
       <td style={{ padding: '10px 14px' }}>
-        <span style={C.pill('var(--accent)', 'rgba(245,197,24,.1)')}>{item.repoName}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+          <span style={C.pill('var(--accent)', 'rgba(245,197,24,.1)')}>{item.repoName}</span>
+          {item.orgName && <span style={{ fontSize: 11, color: 'var(--text2)' }}>{item.orgName}</span>}
+        </div>
       </td>
       <td style={{ padding: '10px 14px' }}>
         <span style={C.pill('var(--red)', 'rgba(239,68,68,.1)')}>{daysSince(item.created_at)} DAYS</span>
@@ -161,10 +213,25 @@ export default function GovernancePage() {
         }
       />
 
+      {/* Org filter */}
+      {isMulti && (
+        <div style={{ marginBottom: 16 }}>
+          <select
+            value={orgFilter}
+            onChange={e => setOrgFilter(e.target.value)}
+            style={C.select}
+            aria-label="Filter governance by organization"
+          >
+            <option>All Organizations</option>
+            {orgOptions.map(o => <option key={o} value={o}>{o}</option>)}
+          </select>
+        </div>
+      )}
+
       {/* Summary stat cards */}
       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4,1fr)', gap: 12, marginBottom: 24 }}>
         <StatBox label="Dead Issues"  value={counts.dead}    sub="OPEN 90+ DAYS"          color="var(--red)"    />
-        <StatBox label="Stale Issues Ratio" value={`${staleIssuesRatio.toFixed(2)}%`} sub={`of ${allIssues.length} total issues`} color={` ${getStatus(staleIssuesRatio).color}`} />
+        <StatBox label="Stale Issues Ratio" value={`${staleIssuesRatio.toFixed(2)}%`} sub={`of ${filteredIssues.length} total issues`} color={` ${getStatus(staleIssuesRatio).color}`} />
         <StatBox label="Zombie PRs"   value={counts.zombie}  sub="PENDING 90+ DAYS"       color="var(--amber)"  />
         <StatBox label="No License"   value={counts.license} sub="COMPLIANCE MISSING"     color="var(--text2)"  />
       </div>
@@ -174,7 +241,7 @@ export default function GovernancePage() {
         <div style={{ fontWeight: 600, marginBottom: 4 }}>Issue Resolution Rate</div>
         <div style={{ ...C.label, marginBottom: 16 }}>Resolution velocity across key repositories</div>
         {topRepos.map(r => {
-          const repoIssues = allIssues.filter(i => i.repoName === r.name)
+          const repoIssues = filteredIssues.filter(i => i.repoName === r.name && (!i.orgName || i.orgName === r.orgLogin))
           const closed     = repoIssues.filter(i => i.state === 'closed').length
           const total      = repoIssues.length
           const rate       = total ? Math.round(closed / total * 100) : null
@@ -255,7 +322,7 @@ export default function GovernancePage() {
 
         {/* Stale Issues */}
         {tab === 'stale' && (
-          staleRepoStats.length ? (
+          filteredStaleRepoStats.length ? (
             <>
               <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
                 {paginatedStaleRepos.map(repo => {
